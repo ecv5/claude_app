@@ -7,7 +7,13 @@ const app = express();
 app.use(cors({ origin: ["http://localhost:5173", "http://localhost:4173"] }));
 app.use(express.json());
 
-const client = new Anthropic();
+// Lazily construct the Anthropic client so the server still boots (and the
+// Finnhub-backed /api/prices endpoint still works) when only FINNHUB_API_KEY
+// is configured. `new Anthropic()` throws when ANTHROPIC_API_KEY is missing.
+let _anthropic: Anthropic | null = null;
+const anthropic = () => (_anthropic ??= new Anthropic());
+
+const FINNHUB_BASE = "https://finnhub.io/api/v1";
 
 const TICKERS = ["NET", "AVGO", "LRCX", "AMAT"] as const;
 type Ticker = (typeof TICKERS)[number];
@@ -15,47 +21,42 @@ type Ticker = (typeof TICKERS)[number];
 const textOf = (content: Anthropic.Message["content"]) =>
   content.reduce((acc, b) => acc + (b.type === "text" ? b.text : ""), "");
 
+interface FinnhubQuote {
+  c: number; // current price
+  d: number; // change
+  dp: number; // percent change
+  pc: number; // previous close
+}
+
+// Real-time quotes from Finnhub. Returns a { ticker: price } map so the
+// existing front end ("Update Prices" button) keeps working unchanged.
 app.get("/api/prices", async (_req: Request, res: Response): Promise<void> => {
+  const key = process.env.FINNHUB_API_KEY;
+  if (!key) {
+    res.status(500).json({ error: "FINNHUB_API_KEY is not set (see .env.example)" });
+    return;
+  }
+
   try {
-    const response = await client.messages.create({
-      model: "claude-opus-4-7",
-      max_tokens: 512,
-      tools: [{ type: "web_search_20260209", name: "web_search" }],
-      messages: [
-        {
-          role: "user",
-          content:
-            "Search for current stock prices for NET, AVGO, LRCX, and AMAT. " +
-            "Return ONLY four lines in this exact format, nothing else:\n" +
-            "NET=<price>\nAVGO=<price>\nLRCX=<price>\nAMAT=<price>",
-        },
-      ],
-    });
+    const results = await Promise.all(
+      TICKERS.map(async (t): Promise<[Ticker, number | null]> => {
+        const r = await fetch(`${FINNHUB_BASE}/quote?symbol=${t}&token=${key}`);
+        if (!r.ok) throw new Error(`Finnhub returned ${r.status} for ${t}`);
+        const q = (await r.json()) as FinnhubQuote;
+        return [t, typeof q.c === "number" && q.c > 0 ? q.c : null];
+      })
+    );
 
-    const text = textOf(response.content);
     const updates: Partial<Record<Ticker, number>> = {};
-
-    for (const line of text.split("\n")) {
-      for (const t of TICKERS) {
-        const match = line.trim().match(new RegExp(`^${t}\\s*[=:]\\s*\\$?([\\d.]+)`, "i"));
-        if (match) {
-          const p = parseFloat(match[1]);
-          if (!isNaN(p) && p > 0) updates[t] = p;
-        }
-      }
-    }
+    for (const [t, price] of results) if (price !== null) updates[t] = price;
 
     if (!Object.keys(updates).length) {
-      res.status(502).json({ error: `Unexpected response: ${text.slice(0, 200)}` });
+      res.status(502).json({ error: "Finnhub returned no valid prices" });
       return;
     }
     res.json(updates);
   } catch (err) {
-    if (err instanceof Anthropic.APIError) {
-      res.status(err.status ?? 500).json({ error: err.message });
-    } else {
-      res.status(500).json({ error: String(err) });
-    }
+    res.status(502).json({ error: `Failed to fetch prices: ${String(err)}` });
   }
 });
 
@@ -67,7 +68,7 @@ app.get("/api/stock/:ticker", async (req: Request, res: Response): Promise<void>
   }
 
   try {
-    const response = await client.messages.create({
+    const response = await anthropic().messages.create({
       model: "claude-opus-4-7",
       max_tokens: 2048,
       tools: [{ type: "web_search_20260209", name: "web_search" }],

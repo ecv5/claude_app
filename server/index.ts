@@ -15,8 +15,9 @@ const anthropic = () => (_anthropic ??= new Anthropic());
 
 const FINNHUB_BASE = "https://finnhub.io/api/v1";
 
-const TICKERS = ["NET", "AVGO", "LRCX", "AMAT"] as const;
-type Ticker = (typeof TICKERS)[number];
+const DEFAULT_TICKERS = ["NET", "AVGO", "LRCX", "AMAT"];
+const SYMBOL_RE = /^[A-Z][A-Z0-9.\-]{0,9}$/;
+const MAX_SYMBOLS = 30;
 
 const textOf = (content: Anthropic.Message["content"]) =>
   content.reduce((acc, b) => acc + (b.type === "text" ? b.text : ""), "");
@@ -28,26 +29,38 @@ interface FinnhubQuote {
   pc: number; // previous close
 }
 
-// Real-time quotes from Finnhub. Returns a { ticker: price } map so the
-// existing front end ("Update Prices" button) keeps working unchanged.
-app.get("/api/prices", async (_req: Request, res: Response): Promise<void> => {
+// Real-time quotes from Finnhub. Accepts an optional ?symbols=A,B,C list
+// (defaults to DEFAULT_TICKERS) and returns a { ticker: price } map, so the
+// front end can request prices for whatever counters the user is tracking.
+app.get("/api/prices", async (req: Request, res: Response): Promise<void> => {
   const key = process.env.FINNHUB_API_KEY;
   if (!key) {
     res.status(500).json({ error: "FINNHUB_API_KEY is not set (see .env.example)" });
     return;
   }
 
+  const raw = typeof req.query.symbols === "string" ? req.query.symbols : "";
+  const requested = raw ? raw.split(",") : DEFAULT_TICKERS;
+  const symbols = [
+    ...new Set(requested.map((s) => s.trim().toUpperCase()).filter((s) => SYMBOL_RE.test(s))),
+  ].slice(0, MAX_SYMBOLS);
+
+  if (!symbols.length) {
+    res.status(400).json({ error: "No valid symbols provided" });
+    return;
+  }
+
   try {
     const results = await Promise.all(
-      TICKERS.map(async (t): Promise<[Ticker, number | null]> => {
-        const r = await fetch(`${FINNHUB_BASE}/quote?symbol=${t}&token=${key}`);
+      symbols.map(async (t): Promise<[string, number | null]> => {
+        const r = await fetch(`${FINNHUB_BASE}/quote?symbol=${encodeURIComponent(t)}&token=${key}`);
         if (!r.ok) throw new Error(`Finnhub returned ${r.status} for ${t}`);
         const q = (await r.json()) as FinnhubQuote;
         return [t, typeof q.c === "number" && q.c > 0 ? q.c : null];
       })
     );
 
-    const updates: Partial<Record<Ticker, number>> = {};
+    const updates: Record<string, number> = {};
     for (const [t, price] of results) if (price !== null) updates[t] = price;
 
     if (!Object.keys(updates).length) {
@@ -62,8 +75,8 @@ app.get("/api/prices", async (_req: Request, res: Response): Promise<void> => {
 
 app.get("/api/stock/:ticker", async (req: Request, res: Response): Promise<void> => {
   const ticker = req.params.ticker.toUpperCase();
-  if (!(TICKERS as readonly string[]).includes(ticker)) {
-    res.status(400).json({ error: `Unknown ticker: ${ticker}` });
+  if (!SYMBOL_RE.test(ticker)) {
+    res.status(400).json({ error: `Invalid ticker: ${ticker}` });
     return;
   }
 

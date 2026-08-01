@@ -204,7 +204,7 @@ export default function StockTracker() {
       setStockData(prev=>({...prev,[ticker]:{...STATIC_FALLBACK[ticker],...data,ticker,name:STATIC_FALLBACK[ticker].name,targetAlloc:STATIC_FALLBACK[ticker].targetAlloc,price:prev[ticker].price}}));
       setLastRefresh(r=>({...r,[ticker]:new Date()}));
     } catch(e) {
-      setRefreshErr(er=>({...er,[ticker]:"Refresh failed — using cached data"}));
+      setRefreshErr(er=>({...er,[ticker]:`Refresh failed: ${(e as Error).message} — using cached data`}));
     }
     setRefreshing(r=>({...r,[ticker]:false}));
   };

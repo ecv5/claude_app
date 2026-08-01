@@ -1,8 +1,9 @@
 import { useState, useEffect } from "react";
 
 const PORTFOLIO_CASH = 170000;
-const TICKERS = ["NET", "AVGO", "LRCX", "AMAT"] as const;
-type Ticker = (typeof TICKERS)[number];
+type Ticker = string;
+const DEFAULT_TICKERS: Ticker[] = ["NET", "AVGO", "LRCX", "AMAT"];
+const SYMBOL_RE = /^[A-Z][A-Z0-9.\-]{0,9}$/;
 
 interface Metric {
   label: string;
@@ -66,6 +67,39 @@ const STATIC_FALLBACK: Record<Ticker, StockInfo> = {
   AMAT: { name:"Applied Materials", ticker:"AMAT", price:"435", analystTarget:520, high52:448, low52:153,  marketCap:"~$346B", peRatio:"~41x", dividend:"~$1.68/yr", earningsDate:"Aug 13, 2026",   entryRange:[400,430], entryLabel:"$400–$430", firstTrim:500, secondTrim:550, stopLossVal:360, targetAlloc:42500, thesis:"Largest semiconductor equipment maker. AI capex supercycle driving multi-year growth.", risks:["China export restrictions","WFE spending cyclicality","Competition from ASML, Lam, KLA"], metrics:[{label:"Revenue (Q2 FY2026)",value:"$7.91B (+11.4%)",target:"~$8.95B Q3",status:"good"},{label:"GAAP EPS",value:"$3.51 vs $2.71",target:"Beat estimates",status:"good"},{label:"Semi Equip Growth",value:">30% guided CY2026",target:"Confirm Aug 13",status:"good"}], watchlist:["Revenue vs $8.95B guidance","Semi equipment growth","AI foundry demand","China exposure"], strategy:[{action:"Buy",level:"$400–$430",note:"Initial position",rationale:"Near current price, entry zone",color:"bg-green-600"},{action:"Trim 25%",level:"$475–$500",note:"Consensus target",rationale:"Analyst consensus cluster",color:"bg-yellow-600"},{action:"Trim 25%",level:"$520–$550",note:"Bull targets",rationale:"Deutsche Bank / Bernstein targets",color:"bg-orange-600"},{action:"Stop Loss",level:"Below $360",note:"Exit position",rationale:"Major support breakdown",color:"bg-red-600"}] },
 };
 
+// Blank template for a newly-added counter. Analyst fields fill in when the
+// user hits Refresh (which calls /api/stock/:ticker); price fills in from the
+// Finnhub-backed /api/prices call.
+const makeDefaultStock = (ticker: Ticker): StockInfo => ({
+  name: ticker, ticker, price: "0",
+  analystTarget: 0, high52: 0, low52: 0, marketCap: "—", peRatio: "—",
+  dividend: "—", earningsDate: "—", entryRange: [0, 0], entryLabel: "—",
+  firstTrim: 0, secondTrim: 0, stopLossVal: 0, targetAlloc: 42500,
+  thesis: "No thesis yet — hit Refresh to pull analyst data.",
+  risks: [], metrics: [], watchlist: [], strategy: [],
+});
+
+const DEFAULT_TX: Record<Ticker, Transaction[]> = {
+  NET: [{ id: 1, date: "2026-05-01", type: "buy", shares: 200, price: 191.25, note: "Initial position" }],
+  AVGO: [], LRCX: [], AMAT: [],
+};
+
+const STORAGE_KEY = "stock-tracker-state-v1";
+interface PersistedState {
+  tickers: Ticker[];
+  stockData: Record<Ticker, StockInfo>;
+  transactions: Record<Ticker, Transaction[]>;
+  notes: Record<Ticker, string>;
+}
+const loadPersisted = (): PersistedState | null => {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    return raw ? (JSON.parse(raw) as PersistedState) : null;
+  } catch {
+    return null;
+  }
+};
+
 const earningsSchedule = [
   {ticker:"AVGO",date:"Jun 3", days:15},
   {ticker:"LRCX",date:"Jul 29",days:71},
@@ -120,13 +154,14 @@ const TabBar = ({tabs,active,onChange}: {tabs:string[];active:string;onChange:(t
   </div>
 );
 
-const StockPicker = ({selected,onChange,stockData,refreshing}: {
-  selected:Ticker;onChange:(t:Ticker)=>void;
+const StockPicker = ({tickers,selected,onChange,stockData,refreshing}: {
+  tickers:Ticker[];selected:Ticker;onChange:(t:Ticker)=>void;
   stockData:Record<Ticker,StockInfo>;refreshing:Record<Ticker,boolean>
 }) => (
   <div className="grid grid-cols-4 gap-2">
-    {TICKERS.map(t=>{
-      const s=stockData[t]; const p=parseFloat(s.price)||0;
+    {tickers.map(t=>{
+      const s=stockData[t]; if(!s) return null;
+      const p=parseFloat(s.price)||0;
       const inE=p>=s.entryRange[0]&&p<=s.entryRange[1];
       return(
         <button key={t} onClick={()=>onChange(t)}
@@ -142,23 +177,28 @@ const StockPicker = ({selected,onChange,stockData,refreshing}: {
 );
 
 export default function StockTracker() {
-  const [selected,      setSelected]      = useState<Ticker>("NET");
+  const [tickers,       setTickers]       = useState<Ticker[]>(()=>loadPersisted()?.tickers ?? DEFAULT_TICKERS);
+  const [selected,      setSelected]      = useState<Ticker>(()=>(loadPersisted()?.tickers ?? DEFAULT_TICKERS)[0] ?? "");
   const [activeTab,     setActiveTab]     = useState("portfolio");
-  const [stockData,     setStockData]     = useState<Record<Ticker,StockInfo>>(STATIC_FALLBACK);
-  const [lastRefresh,   setLastRefresh]   = useState<Record<Ticker,Date|null>>({NET:null,AVGO:null,LRCX:null,AMAT:null});
-  const [refreshing,    setRefreshing]    = useState<Record<Ticker,boolean>>({NET:false,AVGO:false,LRCX:false,AMAT:false});
-  const [refreshErr,    setRefreshErr]    = useState<Record<Ticker,string|null>>({NET:null,AVGO:null,LRCX:null,AMAT:null});
-  const [notes,         setNotes]         = useState<Record<Ticker,string>>({NET:"",AVGO:"",LRCX:"",AMAT:""});
+  const [stockData,     setStockData]     = useState<Record<Ticker,StockInfo>>(()=>loadPersisted()?.stockData ?? STATIC_FALLBACK);
+  const [lastRefresh,   setLastRefresh]   = useState<Record<Ticker,Date|null>>({});
+  const [refreshing,    setRefreshing]    = useState<Record<Ticker,boolean>>({});
+  const [refreshErr,    setRefreshErr]    = useState<Record<Ticker,string|null>>({});
+  const [notes,         setNotes]         = useState<Record<Ticker,string>>(()=>loadPersisted()?.notes ?? {});
   const [saveMsg,       setSaveMsg]       = useState<string|null>(null);
   const [fetchingPrices,setFetchingPrices]= useState(false);
-  const [transactions,  setTransactions]  = useState<Record<Ticker,Transaction[]>>({
-    NET:[{id:1,date:"2026-05-01",type:"buy",shares:200,price:191.25,note:"Initial position"}],
-    AVGO:[],LRCX:[],AMAT:[],
-  });
+  const [transactions,  setTransactions]  = useState<Record<Ticker,Transaction[]>>(()=>loadPersisted()?.transactions ?? DEFAULT_TX);
   const [txForm,  setTxForm]  = useState({date:today(),type:"buy" as "buy"|"sell",shares:"",price:"",note:""});
   const [txError, setTxError] = useState("");
+  const [newTicker, setNewTicker] = useState("");
+  const [manageErr, setManageErr] = useState("");
 
-  useEffect(()=>{},[]);
+  // Persist the durable slices of state so counters survive a reload.
+  useEffect(()=>{
+    try {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify({tickers,stockData,transactions,notes}));
+    } catch { /* storage full or unavailable — ignore */ }
+  },[tickers,stockData,transactions,notes]);
 
   const numPrice = (t: Ticker) => parseFloat(stockData[t]?.price)||0;
 
@@ -166,22 +206,22 @@ export default function StockTracker() {
     setStockData(prev=>{
       const next={...prev};
       for(const [t,p] of Object.entries(priceMap) as [Ticker,number][])
-        if((TICKERS as readonly string[]).includes(t)&&!isNaN(p)&&p>0) next[t]={...next[t],price:String(p)};
+        if(next[t]&&!isNaN(p)&&p>0) next[t]={...next[t],price:String(p)};
       return next;
     });
     setLastRefresh(prev=>{
       const next={...prev};
-      for(const t of Object.keys(priceMap) as Ticker[])
-        if((TICKERS as readonly string[]).includes(t)) next[t]=new Date();
+      for(const t of Object.keys(priceMap) as Ticker[]) next[t]=new Date();
       return next;
     });
   };
 
   const fetchLivePrices = async () => {
+    if(tickers.length===0){setSaveMsg("Add a counter first");setTimeout(()=>setSaveMsg(null),3000);return;}
     setFetchingPrices(true);
     setSaveMsg("Fetching latest prices...");
     try {
-      const res = await fetch("/api/prices");
+      const res = await fetch(`/api/prices?symbols=${encodeURIComponent(tickers.join(","))}`);
       const data = await res.json();
       if(!res.ok) throw new Error(data.error||"Request failed");
       applyPrices(data);
@@ -201,7 +241,10 @@ export default function StockTracker() {
       const res = await fetch(`/api/stock/${ticker}`);
       const data = await res.json();
       if(!res.ok) throw new Error(data.error||"Request failed");
-      setStockData(prev=>({...prev,[ticker]:{...STATIC_FALLBACK[ticker],...data,ticker,name:STATIC_FALLBACK[ticker].name,targetAlloc:STATIC_FALLBACK[ticker].targetAlloc,price:prev[ticker].price}}));
+      setStockData(prev=>{
+        const base=prev[ticker]??STATIC_FALLBACK[ticker]??makeDefaultStock(ticker);
+        return {...prev,[ticker]:{...base,...data,ticker,name:base.name,targetAlloc:base.targetAlloc,price:base.price}};
+      });
       setLastRefresh(r=>({...r,[ticker]:new Date()}));
     } catch(e) {
       setRefreshErr(er=>({...er,[ticker]:"Refresh failed — using cached data"}));
@@ -209,7 +252,39 @@ export default function StockTracker() {
     setRefreshing(r=>({...r,[ticker]:false}));
   };
 
-  const refreshAll = () => TICKERS.forEach(t=>refreshStock(t));
+  const refreshAll = () => tickers.forEach(t=>refreshStock(t));
+
+  const addCounter = () => {
+    const t=newTicker.trim().toUpperCase();
+    if(!t){return;}
+    if(!SYMBOL_RE.test(t)){setManageErr("Enter a valid symbol, e.g. AAPL");return;}
+    if(tickers.includes(t)){setManageErr(`${t} is already tracked`);return;}
+    setTickers(prev=>[...prev,t]);
+    setStockData(prev=>prev[t]?prev:{...prev,[t]:makeDefaultStock(t)});
+    setTransactions(prev=>prev[t]?prev:{...prev,[t]:[]});
+    setNotes(prev=>t in prev?prev:{...prev,[t]:""});
+    setNewTicker("");setManageErr("");setSelected(t);
+  };
+
+  const removeCounter = (t: Ticker) => {
+    if(transactions[t]?.length && !window.confirm(`Remove ${t}? Its ${transactions[t].length} transaction(s) will be deleted.`)) return;
+    const next=tickers.filter(x=>x!==t);
+    setTickers(next);
+    if(selected===t) setSelected(next[0] ?? "");
+    setStockData(prev=>{const n={...prev};delete n[t];return n;});
+    setTransactions(prev=>{const n={...prev};delete n[t];return n;});
+    setNotes(prev=>{const n={...prev};delete n[t];return n;});
+  };
+
+  const moveCounter = (t: Ticker, dir: -1|1) => {
+    setTickers(prev=>{
+      const i=prev.indexOf(t), j=i+dir;
+      if(i<0||j<0||j>=prev.length) return prev;
+      const next=[...prev];
+      [next[i],next[j]]=[next[j],next[i]];
+      return next;
+    });
+  };
 
   const addTransaction = () => {
     const sh=parseFloat(txForm.shares),pr=parseFloat(txForm.price);
@@ -223,7 +298,7 @@ export default function StockTracker() {
   };
 
   const saveToFile = () => {
-    const data={stockData,transactions,notes,savedAt:new Date().toISOString()};
+    const data={tickers,stockData,transactions,notes,savedAt:new Date().toISOString()};
     const b64=btoa(unescape(encodeURIComponent(JSON.stringify(data,null,2))));
     const a=document.createElement("a");
     a.href=`data:application/json;base64,${b64}`;
@@ -238,6 +313,10 @@ export default function StockTracker() {
     reader.onload=(ev)=>{
       try{
         const data=JSON.parse(ev.target?.result as string);
+        if(Array.isArray(data.tickers)&&data.tickers.length){
+          setTickers(data.tickers);
+          setSelected(data.tickers[0]);
+        }
         if(data.stockData)    setStockData(data.stockData);
         if(data.transactions) setTransactions(data.transactions);
         if(data.notes)        setNotes(data.notes);
@@ -259,7 +338,7 @@ export default function StockTracker() {
           if(parts.length<2)continue;
           const t=parts[0].toUpperCase() as Ticker;
           const p=parseFloat(parts[1]);
-          if((TICKERS as readonly string[]).includes(t)&&!isNaN(p)&&p>0) updates[t]=p;
+          if(tickers.includes(t)&&!isNaN(p)&&p>0) updates[t]=p;
         }
         if(!Object.keys(updates).length){setSaveMsg("No matching tickers in CSV");setTimeout(()=>setSaveMsg(null),3000);return;}
         applyPrices(updates);
@@ -270,17 +349,17 @@ export default function StockTracker() {
     reader.readAsText(file);e.target.value="";
   };
 
-  const allPos = TICKERS.reduce((acc,t)=>{acc[t]=calcPosition(transactions[t]);return acc;},{} as Record<Ticker,Position>);
-  const totalInvested   = TICKERS.reduce((s,t)=>s+allPos[t].costBasis,0);
-  const totalCurrent    = TICKERS.reduce((s,t)=>s+allPos[t].sharesHeld*numPrice(t),0);
-  const totalRealised   = TICKERS.reduce((s,t)=>s+allPos[t].realisedPnL,0);
+  const allPos = tickers.reduce((acc,t)=>{acc[t]=calcPosition(transactions[t]??[]);return acc;},{} as Record<Ticker,Position>);
+  const totalInvested   = tickers.reduce((s,t)=>s+allPos[t].costBasis,0);
+  const totalCurrent    = tickers.reduce((s,t)=>s+allPos[t].sharesHeld*numPrice(t),0);
+  const totalRealised   = tickers.reduce((s,t)=>s+allPos[t].realisedPnL,0);
   const totalUnrealised = totalCurrent-totalInvested;
   const cashRemaining   = PORTFOLIO_CASH-totalInvested-totalRealised;
   const totalPnL        = totalUnrealised+totalRealised;
   const totalPnLPct     = totalInvested>0?(totalPnL/totalInvested)*100:0;
-  const stock           = stockData[selected];
+  const stock           = stockData[selected] ?? makeDefaultStock(selected||"—");
   const price           = numPrice(selected);
-  const pos             = allPos[selected];
+  const pos             = allPos[selected] ?? calcPosition([]);
   const inEntry         = price>=stock.entryRange[0]&&price<=stock.entryRange[1];
   const belowStop       = price<stock.stopLossVal;
   const unrPnL          = pos.sharesHeld*price-pos.costBasis;
@@ -359,13 +438,42 @@ export default function StockTracker() {
               </div>
             ))}
           </div>
-          {TICKERS.map(t=>{
-            const s=stockData[t],p=allPos[t],cur=numPrice(t),val=p.sharesHeld*cur;
+
+          <div className="bg-gray-800 rounded-xl p-3">
+            <div className="text-xs text-gray-400 mb-2 uppercase tracking-wide">Manage Counters</div>
+            <div className="flex gap-2">
+              <input value={newTicker}
+                onChange={e=>{setNewTicker(e.target.value.toUpperCase());setManageErr("");}}
+                onKeyDown={e=>{if(e.key==="Enter")addCounter();}}
+                placeholder="Add symbol, e.g. AAPL" maxLength={10}
+                className="flex-1 bg-gray-700 text-white text-sm px-3 py-2 rounded outline-none focus:ring-1 focus:ring-blue-500 uppercase placeholder:normal-case placeholder:text-gray-500"/>
+              <button onClick={addCounter}
+                className="bg-green-700 hover:bg-green-600 text-white text-sm font-semibold px-4 py-2 rounded-lg whitespace-nowrap">+ Add</button>
+            </div>
+            {manageErr&&<div className="text-xs text-red-400 mt-2">{manageErr}</div>}
+            <div className="text-xs text-gray-500 mt-2">Use ▲ ▼ to reorder and ✕ to remove counters below.</div>
+          </div>
+
+          {tickers.length===0&&(
+            <div className="bg-gray-800 rounded-xl p-6 text-center text-sm text-gray-400">
+              No counters yet — add one above to start tracking.
+            </div>
+          )}
+          {tickers.map((t,idx)=>{
+            const s=stockData[t]??makeDefaultStock(t),p=allPos[t],cur=numPrice(t),val=p.sharesHeld*cur;
             const unr=val-p.costBasis,unrP=p.costBasis>0?(unr/p.costBasis)*100:0;
             const inE=cur>=s.entryRange[0]&&cur<=s.entryRange[1];
             const atStop=cur<s.stopLossVal&&p.sharesHeld>0;
             return(
               <div key={t} className={`bg-gray-800 rounded-xl p-4 border ${selected===t?"border-gray-400":"border-transparent"}`}>
+                <div className="flex items-center justify-end gap-1 mb-2">
+                  <button onClick={()=>moveCounter(t,-1)} disabled={idx===0} title="Move up"
+                    className="w-7 h-7 rounded text-gray-400 hover:text-white hover:bg-gray-700 disabled:opacity-30 disabled:hover:bg-transparent text-xs">▲</button>
+                  <button onClick={()=>moveCounter(t,1)} disabled={idx===tickers.length-1} title="Move down"
+                    className="w-7 h-7 rounded text-gray-400 hover:text-white hover:bg-gray-700 disabled:opacity-30 disabled:hover:bg-transparent text-xs">▼</button>
+                  <button onClick={()=>removeCounter(t)} title="Remove counter"
+                    className="w-7 h-7 rounded text-gray-500 hover:text-red-400 hover:bg-gray-700 text-xs">✕</button>
+                </div>
                 <div className="flex items-start justify-between mb-2">
                   <div>
                     <div className="flex items-center gap-2 flex-wrap">
@@ -421,7 +529,7 @@ export default function StockTracker() {
 
       {activeTab==="trades"&&(
         <div className="space-y-3">
-          <StockPicker selected={selected} onChange={setSelected} stockData={stockData} refreshing={refreshing}/>
+          <StockPicker tickers={tickers} selected={selected} onChange={setSelected} stockData={stockData} refreshing={refreshing}/>
           <RefreshBar ticker={selected}/>
           <div className="grid grid-cols-3 gap-2">
             {[
@@ -517,7 +625,7 @@ export default function StockTracker() {
 
       {activeTab==="stock"&&(
         <div className="space-y-3">
-          <StockPicker selected={selected} onChange={setSelected} stockData={stockData} refreshing={refreshing}/>
+          <StockPicker tickers={tickers} selected={selected} onChange={setSelected} stockData={stockData} refreshing={refreshing}/>
           <RefreshBar ticker={selected}/>
           <div className={`rounded-xl p-4 ${belowStop&&pos.sharesHeld>0?"bg-red-900 border border-red-700":"bg-gray-800"}`}>
             <div className="flex items-start justify-between">
@@ -556,7 +664,7 @@ export default function StockTracker() {
 
       {activeTab==="metrics"&&(
         <div className="space-y-3">
-          <StockPicker selected={selected} onChange={setSelected} stockData={stockData} refreshing={refreshing}/>
+          <StockPicker tickers={tickers} selected={selected} onChange={setSelected} stockData={stockData} refreshing={refreshing}/>
           <RefreshBar ticker={selected}/>
           {stock.metrics.map((m,i)=>{
             const sc=statusColors[m.status]||statusColors.watch;
@@ -578,7 +686,7 @@ export default function StockTracker() {
 
       {activeTab==="watchlist"&&(
         <div className="space-y-3">
-          <StockPicker selected={selected} onChange={setSelected} stockData={stockData} refreshing={refreshing}/>
+          <StockPicker tickers={tickers} selected={selected} onChange={setSelected} stockData={stockData} refreshing={refreshing}/>
           <RefreshBar ticker={selected}/>
           <div className="bg-gray-800 rounded-xl p-4">
             <div className="text-xs text-gray-400 mb-3 uppercase tracking-wide">Watch on {stock.earningsDate}</div>
@@ -594,7 +702,7 @@ export default function StockTracker() {
 
       {activeTab==="strategy"&&(
         <div className="space-y-3">
-          <StockPicker selected={selected} onChange={setSelected} stockData={stockData} refreshing={refreshing}/>
+          <StockPicker tickers={tickers} selected={selected} onChange={setSelected} stockData={stockData} refreshing={refreshing}/>
           <RefreshBar ticker={selected}/>
           <div className="bg-gray-800 rounded-xl p-4">
             <div className="flex items-center justify-between mb-3">
@@ -631,7 +739,7 @@ export default function StockTracker() {
       <div className="bg-gray-800 rounded-xl p-4">
         <div className="text-xs text-gray-400 mb-3 uppercase tracking-wide">Earnings Countdown</div>
         <div className="grid grid-cols-4 gap-2">
-          {earningsSchedule.map(e=>{
+          {earningsSchedule.filter(e=>tickers.includes(e.ticker)).map(e=>{
             const pct=Math.max(0,Math.min(100,100-(e.days/90)*100));
             const barColor=e.days<=20?"bg-red-500":e.days<=45?"bg-yellow-500":"bg-blue-500";
             const numColor=e.days<=20?"text-red-400":e.days<=45?"text-yellow-400":"text-blue-400";

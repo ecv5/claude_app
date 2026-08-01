@@ -247,7 +247,7 @@ export default function StockTracker() {
       });
       setLastRefresh(r=>({...r,[ticker]:new Date()}));
     } catch(e) {
-      setRefreshErr(er=>({...er,[ticker]:"Refresh failed — using cached data"}));
+      setRefreshErr(er=>({...er,[ticker]:`Refresh failed: ${(e as Error).message} — using cached data`}));
     }
     setRefreshing(r=>({...r,[ticker]:false}));
   };
